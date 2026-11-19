@@ -44,6 +44,8 @@ pub enum Error {
     CouldNotCreateCacheDir(std::io::Error),
     #[error("The url {url} unexpectedly returned an empty response")]
     EmptyResponse { url: Url },
+    #[error("Invalid gem name: {0}")]
+    InvalidGemName(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -97,6 +99,8 @@ impl Gemserver {
     /// This function doesn't parse the response, so that the parser doesn't have to copy any strings.
     /// Whoever calls this should own the response, and then the parser will borrow &strs from the response.
     pub async fn get_releases_for_gem(&self, gem: &str) -> Result<String> {
+        validate_gem_name(gem)?;
+
         let info_key = format!("info/{}", gem);
         let info_url = self.url.join(&info_key).expect("valid info URL");
 
@@ -247,6 +251,23 @@ pub fn parse_release_from_body(index_body: &str) -> ParseResult<Vec<GemRelease>>
             Some(gem_release)
         })
         .collect()
+}
+
+/// Gem names as defined by RubyGems (`Gem::Specification::VALID_NAME_PATTERN`),
+/// excluding `.` and `..`, which are path traversal components once the name is
+/// interpolated into a cache key.
+fn validate_gem_name(gem: &str) -> Result<()> {
+    let valid = !gem.is_empty()
+        && gem != "."
+        && gem != ".."
+        && gem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::InvalidGemName(gem.to_owned()))
+    }
 }
 
 /// All the information about a release of a gem available on some Gemserver.
@@ -436,6 +457,27 @@ impl std::fmt::Debug for Metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_gem_name_accepts_rubygems_names() {
+        for name in [
+            "rake", "rails", "foo_bar", "foo-bar", "foo.bar", "Foo9", "..foo", "a..b",
+        ] {
+            assert!(validate_gem_name(name).is_ok(), "{name} should be accepted");
+        }
+    }
+
+    #[test]
+    fn test_validate_gem_name_rejects_path_like_names() {
+        for name in [
+            "", ".", "..", "../evil", "a/b", "a\\b", "a b", "a\0b", "a:b", "café",
+        ] {
+            assert!(
+                matches!(validate_gem_name(name), Err(Error::InvalidGemName(_))),
+                "{name:?} should be rejected"
+            );
+        }
+    }
 
     #[test]
     fn test_parser() {
