@@ -214,3 +214,47 @@ fn test_tool_install_package_data_tar_gz_with_trailing_garbage() {
     info_endpoint_mock.assert();
     tarball_mock.assert();
 }
+
+#[test]
+fn test_tool_install_rejects_traversal_dependency_name() {
+    let mut test = RvTest::new();
+    test.enable_cache();
+
+    let releases_mock = test.mock_releases_all_platforms(["4.0.0"].to_vec());
+
+    // `<temp_root>/marker.txt` is four levels above the compact-index cache dir
+    // (`<temp_root>/cache/gemdeps-v0/compact_index`).
+    let marker = test.temp_root().join("marker.txt");
+    fs::write(&marker, b"original").unwrap();
+
+    let info_mock = test
+        .mock_request("GET", "info/evil-tool")
+        .with_status(200)
+        .with_header("content-type", "text/plain; charset=utf-8")
+        .with_body(concat!(
+            "---\n",
+            "1.2.0 ../../../../marker.txt:",
+            "|checksum:db84552fdc9b5d67dd64227ab60a05201554085c00ca5973ec96605af25edc73"
+        ))
+        .create();
+
+    // Pre-fix, `info/../../../../marker.txt` normalizes to this URL and its body is
+    // written to the marker before the body fails to parse.
+    let escaped_mock = test
+        .mock_request("GET", "marker.txt")
+        .with_status(200)
+        .with_body("PWNED")
+        .expect(0)
+        .create();
+
+    let output = test.tool_install(&["evil-tool"]);
+    output.assert_failure();
+
+    assert_eq!(fs::read(&marker).unwrap(), b"original");
+    assert!(!test.temp_root().join("marker.txt.json").exists());
+    output.assert_stderr_contains("InvalidGemName");
+
+    releases_mock.assert();
+    info_mock.assert();
+    escaped_mock.assert();
+}
