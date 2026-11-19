@@ -1,7 +1,7 @@
-use super::{Blob, Result, Storage};
+use super::{Blob, Error, Result, Storage};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 /// Internal struct for JSON serialization of blob metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,25 +50,45 @@ impl FilesystemStorage {
         Self { base_path }
     }
 
-    fn resolve_path(&self, key: &str) -> PathBuf {
-        self.base_path.join(key)
+    fn resolve_path(&self, key: &str) -> Result<PathBuf> {
+        validate_key(key)?;
+        Ok(self.base_path.join(key))
     }
 
-    fn metadata_path(&self, key: &str) -> PathBuf {
-        self.base_path
+    fn metadata_path(&self, key: &str) -> Result<PathBuf> {
+        validate_key(key)?;
+        Ok(self
+            .base_path
             .join("metadata")
-            .join(format!("{}.json", key))
+            .join(format!("{}.json", key)))
+    }
+}
+
+/// Keys are joined onto the storage root, so every segment must be an ordinary
+/// name. `Path::starts_with` compares lexically and would accept `base/info/../..`,
+/// hence the component-wise check.
+fn validate_key(key: &str) -> Result<()> {
+    let valid = !key.is_empty()
+        && !key.contains('\\')
+        && !key.contains('\0')
+        && Path::new(key)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::InvalidKey(key.to_owned()))
     }
 }
 
 impl FilesystemStorage {
     // Private helper methods for implementation
     async fn read(&self, key: &str) -> Result<Vec<u8>> {
-        Ok(tokio::fs::read(self.resolve_path(key)).await?)
+        Ok(tokio::fs::read(self.resolve_path(key)?).await?)
     }
 
     async fn write(&self, key: &str, content: &[u8]) -> Result<()> {
-        let path = self.resolve_path(key);
+        let path = self.resolve_path(key)?;
 
         // Create parent directory if needed
         if let Some(parent) = path.parent() {
@@ -79,7 +99,7 @@ impl FilesystemStorage {
     }
 
     async fn write_metadata_file(&self, key: &str, metadata: &MetadataFile) -> Result<()> {
-        let path = self.metadata_path(key);
+        let path = self.metadata_path(key)?;
 
         // Create metadata directory if needed
         if let Some(parent) = path.parent() {
@@ -92,7 +112,7 @@ impl FilesystemStorage {
     }
 
     async fn read_metadata_file(&self, key: &str) -> Option<MetadataFile> {
-        let path = self.metadata_path(key);
+        let path = self.metadata_path(key).ok()?;
 
         // Try reading metadata JSON directly - no need to check existence first
         // This eliminates one async fs::metadata() call per read
@@ -109,7 +129,10 @@ impl FilesystemStorage {
 #[async_trait]
 impl Storage for FilesystemStorage {
     async fn exists(&self, key: &str) -> bool {
-        tokio::fs::metadata(self.resolve_path(key)).await.is_ok()
+        match self.resolve_path(key) {
+            Ok(path) => tokio::fs::metadata(path).await.is_ok(),
+            Err(_) => false,
+        }
     }
 
     async fn read_blob(&self, key: &str) -> Result<Blob> {
@@ -218,5 +241,34 @@ mod tests {
         let read_blob = storage.read_blob("testfile").await.unwrap();
         assert_eq!(read_blob.content, b"content");
         assert_eq!(read_blob.etag, None);
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_storage_rejects_traversal_keys() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().join("cache");
+        fs::create_dir_all(&base).unwrap();
+        let storage = FilesystemStorage::new(base);
+        let marker = temp_dir.path().join("marker");
+        fs::write(&marker, b"original").unwrap();
+
+        let blob = Blob::new(b"PWNED".to_vec());
+        for key in [
+            "info/../../marker",
+            "../marker",
+            "/tmp/marker",
+            "info\\..\\..\\marker",
+        ] {
+            assert!(matches!(
+                storage.write_blob(key, &blob).await,
+                Err(Error::InvalidKey(_))
+            ));
+            assert!(!storage.exists(key).await);
+            assert!(matches!(
+                storage.read_blob(key).await,
+                Err(Error::InvalidKey(_))
+            ));
+        }
+        assert_eq!(fs::read(&marker).unwrap(), b"original");
     }
 }

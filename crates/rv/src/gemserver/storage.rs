@@ -14,6 +14,8 @@ pub enum Error {
     SerdeJson(#[from] serde_json::Error),
     #[error("Cannot verify empty content against digest")]
     EmptyContent,
+    #[error("Refusing to use unsafe storage key: {0}")]
+    InvalidKey(String),
     #[error(
         "The checksum of /{path} does not match the checksum provided by the server! Something is wrong. {message}"
     )]
@@ -164,6 +166,13 @@ impl Blob {
 /// - `exists`: Check if a blob exists at the given key
 /// - `read_blob`: Read a blob and its metadata from storage
 /// - `write_blob`: Write a blob and its metadata to storage
+///
+/// # Keys
+///
+/// A key is a non-empty relative path whose `/`-separated segments are ordinary
+/// names. Keys containing `.`, `..`, a leading `/`, or `\` separators must be
+/// rejected, and implementations must refuse any key that would resolve outside
+/// their root.
 ///
 /// # The Blob Type
 ///
